@@ -593,8 +593,11 @@ skip_pgp_packets(pgp_source_t *src, const std::set<pgp_pkt_type_t> &pkts)
 {
     do {
         int pkt = stream_pkt_type(src);
-        if (pkt <= 0) {
+        if (!pkt) {
             break;
+        }
+        if (pkt < 0) {
+            return false;
         }
         if (pkts.find((pgp_pkt_type_t) pkt) == pkts.end()) {
             return true;
@@ -681,6 +684,56 @@ done:
 }
 
 rnp_result_t
+process_pgp_key_auto(pgp_source_t &          src,
+                     pgp_transferable_key_t &key,
+                     bool                    allowsub,
+                     bool                    skiperrors)
+{
+    key = {};
+    uint64_t srcpos = src.readb;
+    int      ptag = stream_pkt_type(&src);
+    if (is_subkey_pkt(ptag) && allowsub) {
+        pgp_transferable_subkey_t subkey;
+        rnp_result_t              ret = process_pgp_subkey(src, subkey, skiperrors);
+        if (subkey.subkey.tag != PGP_PKT_RESERVED) {
+            try {
+                key.subkeys.push_back(std::move(subkey));
+            } catch (const std::exception &e) {
+                RNP_LOG("%s", e.what());
+                ret = RNP_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        /* change error code if we didn't process anything at all */
+        if (srcpos == src.readb) {
+            ret = RNP_ERROR_BAD_STATE;
+        }
+        return ret;
+    }
+
+    rnp_result_t ret = RNP_ERROR_BAD_FORMAT;
+    if (!is_primary_key_pkt(ptag)) {
+        RNP_LOG("wrong key tag: %d at pos %" PRIu64, ptag, src.readb);
+    } else {
+        ret = process_pgp_key(&src, key, skiperrors);
+    }
+    if (skiperrors && (ret == RNP_ERROR_BAD_FORMAT) &&
+        !skip_pgp_packets(&src,
+                          {PGP_PKT_TRUST,
+                           PGP_PKT_SIGNATURE,
+                           PGP_PKT_USER_ID,
+                           PGP_PKT_USER_ATTR,
+                           PGP_PKT_PUBLIC_SUBKEY,
+                           PGP_PKT_SECRET_SUBKEY})) {
+        ret = RNP_ERROR_READ;
+    }
+    /* change error code if we didn't process anything at all */
+    if (srcpos == src.readb) {
+        ret = RNP_ERROR_BAD_STATE;
+    }
+    return ret;
+}
+
+rnp_result_t
 process_pgp_keys(pgp_source_t *src, pgp_key_sequence_t &keys, bool skiperrors)
 {
     bool          armored = false;
@@ -693,9 +746,10 @@ process_pgp_keys(pgp_source_t *src, pgp_key_sequence_t &keys, bool skiperrors)
     keys.keys.clear();
     /* check whether keys are armored */
 armoredpass:
-    if (is_armored_source(src)) {
-        if ((ret = init_armored_src(&armorsrc, src))) {
+    if ((src->type != PGP_STREAM_ARMORED) && is_armored_source(src)) {
+        if (init_armored_src(&armorsrc, src)) {
             RNP_LOG("failed to parse armored data");
+            ret = RNP_ERROR_READ;
             goto finish;
         }
         armored = true;
@@ -705,27 +759,17 @@ armoredpass:
     /* read sequence of transferable OpenPGP keys as described in RFC 4880, 11.1 - 11.2 */
     while (!src_eof(src) && !src_error(src)) {
         pgp_transferable_key_t curkey;
-        int                    ptag = stream_pkt_type(src);
-        if (!is_primary_key_pkt(ptag)) {
-            RNP_LOG("wrong key tag: %d at pos %" PRIu64, ptag, src->readb);
-            ret = RNP_ERROR_BAD_FORMAT;
+        ret = process_pgp_key_auto(*src, curkey, false, skiperrors);
+        if (ret && (!skiperrors || (ret != RNP_ERROR_BAD_FORMAT))) {
             goto finish;
         }
-
-        ret = process_pgp_key(src, curkey, skiperrors);
-        if ((ret == RNP_ERROR_BAD_FORMAT) && skiperrors &&
-            skip_pgp_packets(src,
-                             {PGP_PKT_TRUST,
-                              PGP_PKT_SIGNATURE,
-                              PGP_PKT_USER_ID,
-                              PGP_PKT_USER_ATTR,
-                              PGP_PKT_PUBLIC_SUBKEY,
-                              PGP_PKT_SECRET_SUBKEY})) {
+        /* check whether we actually read any key or just skipped erroneous packets */
+        if (curkey.key.tag == PGP_PKT_RESERVED) {
             continue;
         }
-        if (ret) {
-            goto finish;
-        }
+        has_secret |= (curkey.key.tag == PGP_PKT_SECRET_KEY);
+        has_public |= (curkey.key.tag == PGP_PKT_PUBLIC_KEY);
+
         try {
             keys.keys.emplace_back(std::move(curkey));
         } catch (const std::exception &e) {
@@ -733,9 +777,6 @@ armoredpass:
             ret = RNP_ERROR_OUT_OF_MEMORY;
             goto finish;
         }
-
-        has_secret |= (ptag == PGP_PKT_SECRET_KEY);
-        has_public |= (ptag == PGP_PKT_PUBLIC_KEY);
     }
 
     /* file may have multiple armored keys */
@@ -771,10 +812,10 @@ process_pgp_key(pgp_source_t *src, pgp_transferable_key_t &key, bool skiperrors)
 
     key = pgp_transferable_key_t();
     /* check whether keys are armored */
-    if (is_armored_source(src)) {
-        if ((ret = init_armored_src(&armorsrc, src))) {
+    if ((src->type != PGP_STREAM_ARMORED) && is_armored_source(src)) {
+        if (init_armored_src(&armorsrc, src)) {
             RNP_LOG("failed to parse armored data");
-            return ret;
+            return RNP_ERROR_READ;
         }
         armored = true;
         src = &armorsrc;

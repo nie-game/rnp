@@ -852,7 +852,7 @@ pgp_key_latest_selfsig(pgp_key_t *key, pgp_sig_subpacket_type_t subpkt)
             continue;
         }
 
-        if (subpkt && !signature_get_subpkt(&sig->sig, subpkt)) {
+        if (subpkt && !sig->sig.get_subpkt(subpkt)) {
             continue;
         }
 
@@ -1612,7 +1612,7 @@ update_sig_expiration(pgp_signature_t *dst, const pgp_signature_t *src, uint32_t
         return false;
     }
     if (!expiry) {
-        pgp_sig_subpkt_t *subpkt = signature_get_subpkt(dst, PGP_SIG_SUBPKT_KEY_EXPIRY);
+        pgp_sig_subpkt_t *subpkt = dst->get_subpkt(PGP_SIG_SUBPKT_KEY_EXPIRY);
         signature_remove_subpkt(dst, subpkt);
     } else {
         signature_set_key_expiration(dst, expiry);
@@ -1888,14 +1888,18 @@ find_suitable_key(pgp_op_t            op,
     pgp_key_request_ctx_t ctx{.op = op, .secret = pgp_key_is_secret(key)};
     ctx.search.type = PGP_KEY_SEARCH_FINGERPRINT;
 
+    pgp_key_t *subkey = NULL;
     for (auto &fp : key->subkey_fps) {
         ctx.search.by.fingerprint = fp;
-        pgp_key_t *subkey = pgp_request_key(key_provider, &ctx);
-        if (subkey && (pgp_key_get_flags(subkey) & desired_usage)) {
-            return subkey;
+        pgp_key_t *cur = pgp_request_key(key_provider, &ctx);
+        if (!cur || !(pgp_key_get_flags(cur) & desired_usage) || !cur->valid) {
+            continue;
+        }
+        if (!subkey || (pgp_key_get_creation(cur) > pgp_key_get_creation(subkey))) {
+            subkey = cur;
         }
     }
-    return NULL;
+    return subkey;
 }
 
 pgp_hash_alg_t
